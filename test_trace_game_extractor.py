@@ -4,6 +4,7 @@
 from __future__ import annotations
 
 import json
+import hashlib
 import contextlib
 import io
 import shutil
@@ -379,6 +380,30 @@ class ExtractionIntegrationTests(unittest.TestCase):
             self.assertEqual(payload['view'], 'playercam')
             self.assertNotIn('periods', payload)
             self.assertEqual(payload['timeline_alignment']['status'], 'unknown')
+
+    def test_cli_metadata_capture_with_real_synthetic_remux(self) -> None:
+        from trace_game_extractor import main
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            first, second, output = root / "first.mp4", root / "second.mp4", root / "game.mp4"
+            self._make_part(first, with_audio=True)
+            self._make_part(second, with_audio=False)
+            originals = [path.read_bytes() for path in (first, second)]
+            source = root / "game.json"
+            source.write_text(json.dumps({"all_events": [{"utc_time": 1700000000500}], "hls_folders": []}))
+            with mock.patch("urllib.request.build_opener") as network:
+                self.assertEqual(main([str(first), str(second), "--output", str(output), "--metadata",
+                                       "--metadata-source", "game", str(source)]), 0)
+                network.assert_not_called()
+            bundle = json.loads(output.with_suffix(".metadata.json").read_text())
+            sidecar = json.loads(sidecar_path(output).read_text())
+            self.assertEqual(bundle["export"]["video_sha256"], hashlib.sha256(output.read_bytes()).hexdigest())
+            self.assertEqual(bundle["export"]["sidecar"], sidecar)
+            self.assertEqual(len(sidecar["periods"]), 2)
+            self.assertEqual(bundle["documents"][0]["data"]["all_events"][0]["utc_time"], 1700000000500)
+            self.assertEqual(bundle["trust"]["timeline_alignment"], "unverified")
+            self.assertEqual(self._stream_types(output), ["video"])
+            self.assertEqual([path.read_bytes() for path in (first, second)], originals)
 
 
 if __name__ == "__main__":

@@ -4,3 +4,5 @@
 !/README.md
 !/trace_game_extractor.py
 !/test_trace_game_extractor.py
+!/trace_metadata.py
+!/test_trace_metadata.py

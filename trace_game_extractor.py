@@ -4,6 +4,7 @@
 from __future__ import annotations
 
 import argparse
+import hashlib
 import json
 import os
 import re
@@ -16,6 +17,18 @@ import urllib.request
 from pathlib import Path
 from typing import Sequence
 from urllib.parse import urljoin, urlparse
+
+from trace_metadata import (
+    KINDS,
+    MetadataError,
+    build_bundle,
+    camera_inventory,
+    read_json_source,
+    sanitize,
+    validate_destination,
+    validate_kinds,
+    write_bundle,
+)
 
 
 SCRIPT_DIR = Path(__file__).resolve().parent
@@ -131,37 +144,16 @@ def inspect_views(metadata: dict) -> dict:
     Camera type Superfly is displayed as PlayerCam by Trace's public frontend.
     Unknown camera types are preserved; no synthetic URLs or assumed MultiCam.
     """
-    cameras, seen = {}, set()
-    def visit(event):
-        if not isinstance(event, dict):
-            return
-        meta, dynamic = event.get("meta"), event.get("dynamic")
-        camera = meta.get("camera") if isinstance(meta, dict) else None
-        manifest = dynamic.get("hls") if isinstance(dynamic, dict) else None
-        if isinstance(camera, dict) and isinstance(manifest, str) and manifest:
-            kind = camera.get("type")
-            if isinstance(kind, str) and (kind, manifest) not in seen:
-                seen.add((kind, manifest))
-                label = "PlayerCam" if kind == "Superfly" else kind
-                cameras[label] = cameras.get(label, 0) + 1
-        sources = event.get("sources", [])
-        if isinstance(sources, list):
-            for source in sources:
-                visit(source)
-    for key in ("events", "all_events"):
-        events = metadata.get(key, [])
-        if isinstance(events, list):
-            for event in events:
-                visit(event)
     folders = metadata.get("hls_folders", [])
     return {"full_game_parts": len(folders) if isinstance(folders, list) else 0,
-            "explicit_camera_manifest_counts": cameras,
+            "explicit_camera_manifest_counts": camera_inventory(metadata),
             "note": "Only advertised metadata; absence does not prove no other view exists. No video fetched."}
 
 
-def resolve_game_sources(game_ref: str) -> list[str]:
+def resolve_game_sources(game_ref: str, *, metadata: dict | None = None) -> list[str]:
     """Game ref -> the highest-quality variant manifest URL for each half, in order."""
-    metadata = fetch_game_metadata(game_ref)
+    if metadata is None:
+        metadata = fetch_game_metadata(game_ref)
     team_id = game_ref.split("-", 1)[0]
     folders = metadata.get("hls_folders")
     if not isinstance(folders, list) or not folders or not all(
@@ -564,14 +556,40 @@ def _parser() -> argparse.ArgumentParser:
                         help="Also import a playercam/multicam manifest or MP4 as a separate clip. Repeatable.")
     parser.add_argument("--source-start-seconds", type=float,
                         help="Known full-game start time of one explicit contiguous input; otherwise alignment stays unknown.")
+    metadata_mode = parser.add_mutually_exclusive_group()
+    metadata_mode.add_argument("--metadata", action="store_true",
+                               help="Save source metadata beside the primary video; labels and alignment remain unverified.")
+    metadata_mode.add_argument("--metadata-only", action="store_true",
+                               help="Capture JSON metadata only; no video download or FFmpeg required.")
+    parser.add_argument("--metadata-source", nargs=2, action="append", default=[], metavar=("KIND", "SOURCE"),
+                        help=f"Explicit local JSON or HTTPS source. Kinds: {', '.join(KINDS)}. Repeatable.")
+    parser.add_argument("--metadata-output", type=Path,
+                        help="Metadata JSON destination; requires --metadata or --metadata-only.")
     parser.add_argument("--ffmpeg", default="ffmpeg", help=argparse.SUPPRESS)
     parser.add_argument("--ffprobe", default="ffprobe", help=argparse.SUPPRESS)
     return parser
 
 
+def _default_output(args: argparse.Namespace, game_ref: str | None) -> Path:
+    audio = "with-audio" if args.with_audio else "video-only"
+    if game_ref:
+        return SCRIPT_DIR / f"Trace-{game_ref}.{audio}.mp4"
+    if args.view != "tracecam":
+        return SCRIPT_DIR / f"Trace-{args.view}.{audio}.mp4"
+    return DEFAULT_WITH_AUDIO_OUTPUT if args.with_audio else DEFAULT_VIDEO_ONLY_OUTPUT
+
+
 def main(argv: Sequence[str] | None = None) -> int:
     args = _parser().parse_args(argv)
     try:
+        metadata_mode = args.metadata or args.metadata_only
+        if (args.metadata_source or args.metadata_output) and not metadata_mode:
+            raise MetadataError("Metadata options require --metadata or --metadata-only.")
+        if args.metadata_only and (
+            args.inputs or args.output or args.extra_view or args.with_audio
+            or args.view != "tracecam" or args.source_start_seconds is not None
+        ):
+            raise MetadataError("Metadata-only mode cannot use video options; choose --metadata-output instead.")
         if args.game and args.inputs:
             raise ExtractorError("Pass either --game or manifest inputs, not both.")
         if args.game and args.view != "tracecam":
@@ -581,25 +599,44 @@ def main(argv: Sequence[str] | None = None) -> int:
         if any(view not in ("playercam", "multicam") for view, _ in args.extra_view):
             raise ExtractorError("--extra-view accepts playercam or multicam only.")
         if args.list_views:
-            if not args.game or args.extra_view or args.output or args.with_audio or args.overwrite:
+            if not args.game or args.extra_view or args.output or args.with_audio or args.overwrite or metadata_mode:
                 raise ExtractorError("--list-views requires --game and cannot be combined with extraction options.")
             print(json.dumps(inspect_views(fetch_game_metadata(parse_game_ref(args.game))), indent=2))
             return 0
-        if args.game:
-            game_ref = parse_game_ref(args.game)
-            sources: Sequence[str] = resolve_game_sources(game_ref)
-            default_name = f"Trace-{game_ref}.{'with-audio' if args.with_audio else 'video-only'}.mp4"
-            default_output = SCRIPT_DIR / default_name
-        else:
-            if not args.inputs:
-                raise ExtractorError("At least one input (or --game) is required.")
-            sources = [resolve_captured_source(source) for source in args.inputs]
-            default_output = (
-                DEFAULT_WITH_AUDIO_OUTPUT if args.with_audio else DEFAULT_VIDEO_ONLY_OUTPUT
-            )
-            if args.view != "tracecam":
-                default_output = default_output.with_name(f"Trace-{args.view}.{'with-audio' if args.with_audio else 'video-only'}.mp4")
+        if not args.game and not args.inputs and not args.metadata_only:
+            raise ExtractorError("At least one input (or --game) is required.")
+        game_ref = parse_game_ref(args.game) if args.game else None
+        default_output = _default_output(args, game_ref)
         output = (args.output if args.output is not None else default_output).expanduser().resolve()
+        bundle, game_metadata, metadata_output = None, None, None
+        metadata_inputs = [Path(source) for _, source in args.metadata_source
+                           if urlparse(source).scheme not in {"http", "https"}]
+        if metadata_mode:
+            validate_kinds([kind for kind, _ in args.metadata_source] + (["game"] if game_ref else []))
+            default_metadata = (
+                SCRIPT_DIR / f"Trace-{game_ref}.metadata.json" if game_ref
+                else SCRIPT_DIR / "Trace.metadata.json"
+            ) if args.metadata_only else output.with_suffix(".metadata.json")
+            video_outputs = [output, *(output.with_name(f"{output.stem}.{view}-{index:02d}.mp4")
+                                      for index, (view, _) in enumerate(args.extra_view, 1))]
+            protected = [*metadata_inputs, *video_outputs, *(sidecar_path(path) for path in video_outputs),
+                         *(Path(source) for source in [*args.inputs, *(s for _, s in args.extra_view)]
+                           if urlparse(source).scheme not in {"http", "https"})]
+            metadata_output = validate_destination(
+                args.metadata_output or default_metadata, overwrite=args.overwrite, protected=protected
+            )
+            if game_ref:
+                team_id = game_ref.split("-", 1)[0]
+                game_metadata = read_json_source(f"{TRACE_API_BASE}/{team_id}/games/{game_ref}/game.json")
+            bundle = build_bundle(args.metadata_source, game_ref=game_ref, game_data=game_metadata)
+            if args.metadata_only:
+                write_bundle(metadata_output, bundle, overwrite=args.overwrite)
+                print(f"Saved {len(bundle['documents'])} metadata document(s); no video fetched. Alignment and identity unverified.")
+                return 0
+        if game_ref is not None:
+            sources: Sequence[str] = resolve_game_sources(game_ref, metadata=game_metadata)
+        else:
+            sources = [resolve_captured_source(source) for source in args.inputs]
 
         # Each alternate is kept separate: its timebase and identity may differ.
         extras = [(view, resolve_captured_source(source),
@@ -608,6 +645,9 @@ def main(argv: Sequence[str] | None = None) -> int:
         original_sources = [_local_source(source) for source in [*args.inputs, *(item[1] for item in args.extra_view)]]
         local_inputs = {Path(source).expanduser().resolve() for source in [*original_sources, *sources, *(item[1] for item in extras)]
                         if urlparse(source).scheme not in {"http", "https"}}
+        local_inputs.update(path.expanduser().resolve() for path in metadata_inputs)
+        if metadata_output is not None:
+            validate_destination(metadata_output, overwrite=args.overwrite, protected=local_inputs)
         for destination in [output, *(item[2] for item in extras)]:
             if destination.resolve() in local_inputs or sidecar_path(destination).resolve() in local_inputs:
                 raise ExtractorError("No output or sidecar may replace any primary or alternate input.")
@@ -624,12 +664,28 @@ def main(argv: Sequence[str] | None = None) -> int:
             view=args.view,
             source_start_seconds=args.source_start_seconds,
         )
+        if bundle is not None:
+            assert metadata_output is not None
+            digest = hashlib.sha256()
+            try:
+                with output.open("rb") as stream:
+                    for block in iter(lambda: stream.read(1024 * 1024), b""):
+                        digest.update(block)
+            except OSError:
+                raise MetadataError("Video was extracted but its metadata hash could not be read.") from None
+            bundle["export"] = {
+                "video_name": output.name, "video_sha256": digest.hexdigest(),
+                "sidecar": sanitize(read_json_source(str(sidecar_path(output)))),
+                "timeline_alignment": "unverified",
+            }
+            write_bundle(metadata_output, bundle, overwrite=args.overwrite)
+            print(f"Saved {len(bundle['documents'])} metadata document(s), bound to the primary video hash. Alignment unverified.")
         for view, source, destination in extras:
             extract_game([source], destination, with_audio=args.with_audio,
                          overwrite=args.overwrite, ffmpeg=args.ffmpeg, ffprobe=args.ffprobe, view=view)
         if extras:
             print("Alternate clips preserved separately; alignment and player identity require verification.")
-    except ExtractorError as error:
+    except (ExtractorError, MetadataError) as error:
         print(f"error: {error}", file=sys.stderr)
         return 1
     except KeyboardInterrupt:
