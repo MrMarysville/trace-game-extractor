@@ -1,0 +1,6 @@
+# Allowlist source only; everything else (including media and credentials) stays local.
+/*
+!/.gitignore
+!/README.md
+!/trace_game_extractor.py
+!/test_trace_game_extractor.py
